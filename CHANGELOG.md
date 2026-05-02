@@ -2,6 +2,77 @@
 
 <!-- version list -->
 
+## v1.5.0 (2026-05-02)
+
+### Bug Fixes
+
+- Add schema-driven module type property detection and component comparison (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Update module type scalar properties (e.g. part_number) on --update (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Module change detection and diff-u report without --update (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Display none and empty string consistently in diff-u output (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Resolve all pre-commit issues (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Upload module-type images before scalar patch in existing-module path (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Three module change detection bugs (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Apply component changes for existing module types during --update (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Remove module_bay_templates from _no_module_type for idempotent caching (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Retry transient graphql connection errors and fix module type change report ordering (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Catch graphqlerror and netboxrequesterror with user-friendly messages (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Detect and skip duplicate (manufacturer, model) yaml definitions (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Apply --remove-components for module types and reject argparse abbreviations (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Address pr review findings and add coverage tests (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Address second-round coderabbit review findings (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Ruff format/c901 (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Defer module_type_properties loading; tighten mock shapes (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Address pr review round 9 findings (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Round-10 cr fixes: narrow except, preload guard, test hardening (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Re-raise preload errors instead of swallowing and caching empty records (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Defer module_updated accounting to post-component-reconciliation (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Count scalar success when component removals skipped + update docs (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Treat all-failed component api calls as a failure, not cached (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Distinguish partial from full component reconciliation via delta/count (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Exclusive module outcome counters, partial rendering, resolver sentinel + doc (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- **schema_reader**: Use explicit allowlist for scalar property detection (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Accurate applied counts in log, module failure outcomes, and test hardening (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Correct module outcome reason and harden test assertions (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+
+
+### Chores
+
+- Ruff format (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- **deps**: Bump the python-deps group with 2 updates (#63, [`db057ab`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/db057abb807d487cbddcd88a679a5d2c3722a63d))
+- **deps**: Bump gitpython from 3.1.46 to 3.1.47 (#62, [`2341906`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/23419063f9a2b65698444b4ed6987863de3d5fa0))
+
+
+### Documentation
+
+- Round-11 cr fixes — update docstrings for 3-tuple return and per-page callback (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+
+
+### Features
+
+- Schema-driven property comparison for device/module types (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Full component comparison for module types with description/color/rf_role coverage (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Validate graphql component fetch counts against rest api (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Graphql count mismatch retry logic, 100% docstring coverage (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+
+
+### Refactoring
+
+- Extract shared diff-u formatter into core/formatting.py (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Reuse changedetector instance via lazy cached property (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+- Remove power-port singular alias entirely (closes #67) (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+
+
+### Testing
+
+- Tighten pending-removal and rack-type summary assertions (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
+
+
+
+### Contributors
+
+@dependabot[bot], @marcinpsk
+
 ## v1.4.0 (2026-04-23)
 
 ### Bug Fixes
