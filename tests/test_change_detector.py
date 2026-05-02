@@ -142,14 +142,6 @@ class TestCompareComponents:
         changes = detector._compare_components(yaml_data, 1)
         assert any(c.component_name == "eth0" and c.change_type == ChangeType.COMPONENT_CHANGED for c in changes)
 
-    def test_power_port_alias_merged(self):
-        """'power-port' alias maps to same cache as 'power-ports'."""
-        detector = self._make_detector()
-        detector.device_types.cached_components = {"power_port_templates": {("device", 1): {}}}
-        yaml_data = {"power-port": [{"name": "PSU1", "type": "iec-60320-c14"}]}
-        changes = detector._compare_components(yaml_data, 1)
-        assert any(c.component_name == "PSU1" and c.change_type == ChangeType.COMPONENT_ADDED for c in changes)
-
     def test_component_without_name_is_skipped(self):
         """YAML component entry with no 'name' key must be skipped (line 350 continue)."""
         detector = self._make_detector()
@@ -534,4 +526,82 @@ class TestCompareComponentPropertiesMappings:
             yaml_comp, netbox_comp, ["_mappings"], comp_type="front-ports"
         )
         # Positions match → no change
+        assert changes == []
+
+
+# ---------------------------------------------------------------------------
+# _load_device_type_properties exception fallback (lines 109-110)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadDeviceTypePropertiesFallback:
+    """Tests for the exception fallback in _load_device_type_properties."""
+
+    def test_import_error_during_load_returns_fallback_list(self):
+        from unittest.mock import patch
+
+        from core.change_detector import (
+            _DEVICE_TYPE_PROPERTIES_FALLBACK,
+            _load_device_type_properties,
+        )
+
+        with patch(
+            "core.change_detector.load_properties_for_type",
+            side_effect=ImportError("settings module unavailable"),
+        ):
+            result = _load_device_type_properties()
+
+        assert result == list(_DEVICE_TYPE_PROPERTIES_FALLBACK)
+
+    def test_attribute_error_during_load_returns_fallback_list(self):
+        from unittest.mock import patch
+
+        from core.change_detector import (
+            _DEVICE_TYPE_PROPERTIES_FALLBACK,
+            _load_device_type_properties,
+        )
+
+        with patch(
+            "core.change_detector.load_properties_for_type",
+            side_effect=AttributeError("REPO_PATH not set"),
+        ):
+            result = _load_device_type_properties()
+
+        assert result == list(_DEVICE_TYPE_PROPERTIES_FALLBACK)
+
+    def test_unexpected_exception_propagates(self):
+        """Non-import/attribute errors must not be silenced."""
+        import pytest
+        from unittest.mock import patch
+
+        from core.change_detector import _load_device_type_properties
+
+        with patch(
+            "core.change_detector.load_properties_for_type",
+            side_effect=RuntimeError("schema unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="schema unavailable"):
+                _load_device_type_properties()
+
+
+# ---------------------------------------------------------------------------
+# _MISSING sentinel skip in _compare_device_type_properties (line 246)
+# ---------------------------------------------------------------------------
+
+
+class TestCompareDeviceTypePropertiesMissingAttribute:
+    """Tests for the _MISSING sentinel guard inside _compare_device_type_properties."""
+
+    def test_attribute_absent_from_netbox_object_is_skipped(self):
+        """When netbox_dt doesn't have the attribute, the property is skipped (no change reported)."""
+        from unittest.mock import patch
+
+        _FIXED_PROPS = ["u_height", "is_full_depth"]
+        with patch("core.change_detector.get_device_type_properties", return_value=_FIXED_PROPS):
+            detector = ChangeDetector(MagicMock(), MagicMock())
+            # A plain object() has no extra attributes, so getattr returns _MISSING.
+            netbox_dt = object()
+
+            changes = detector._compare_device_type_properties({"u_height": 2}, netbox_dt)
+
         assert changes == []

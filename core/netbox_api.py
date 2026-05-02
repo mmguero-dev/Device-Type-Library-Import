@@ -1,5 +1,8 @@
+"""NetBox REST and GraphQL API client for importing device and module type libraries."""
+
 from collections import Counter
 import concurrent.futures
+from functools import lru_cache
 import itertools
 import queue
 import re
@@ -11,9 +14,17 @@ from sys import exit as system_exit
 import glob
 from pathlib import Path
 
-from core.change_detector import COMPONENT_ALIASES, ChangeType
-from core.graphql_client import GraphQLError, NetBoxGraphQLClient
+from core.change_detector import ChangeDetector, ChangeType
+from core.compat import device_type_filter_kwargs, module_type_filter_kwargs, module_type_filter_key
+from core.formatting import log_property_diffs
+from core.graphql_client import GraphQLCountMismatchError, GraphQLError, NetBoxGraphQLClient
 from core.normalization import values_equal
+from core.outcomes import EntityKind, Outcome, OutcomeRegistry
+from core.schema_reader import load_properties_for_type
+from core.update_failure_resolver import (
+    FailureKind,
+    classify_device_type_update_failure,
+)
 
 
 def _build_auth_header(token):
@@ -49,6 +60,49 @@ def _retry_on_connection_error(func, *args, **kwargs):
             wait = _RETRY_BACKOFF[attempt] if attempt < len(_RETRY_BACKOFF) else _RETRY_BACKOFF[-1]
             time.sleep(wait)
 
+
+# Module type scalar properties that can be compared and updated.
+# Loaded from the cloned devicetype-library schema at runtime; the list below
+# serves as a fallback when the schema is not yet available (e.g. before the
+# first repo clone).  Identity fields (manufacturer, model) and complex objects
+# (attribute_data) are excluded by the schema reader.
+_MODULE_TYPE_PROPERTIES_FALLBACK = [
+    "part_number",
+    "description",
+    "comments",
+    "airflow",
+    "weight",
+    "weight_unit",
+]
+
+_MODULE_TYPE_SCHEMA_EXCLUDE = {"manufacturer", "model", "attribute_data", "profile"}
+
+
+@lru_cache(maxsize=1)
+def _load_module_type_properties():
+    """Load module type scalar properties from the schema, falling back to hardcoded list.
+
+    The result is cached after the first call, which happens after the repo checkout
+    so the schema files are available.
+    """
+    try:
+        from core import settings as _settings
+
+        props = load_properties_for_type(
+            os.path.join(_settings.REPO_PATH, "schema"),
+            "moduletype",
+            exclude=_MODULE_TYPE_SCHEMA_EXCLUDE,
+        )
+        return props if props else list(_MODULE_TYPE_PROPERTIES_FALLBACK)
+    except (ImportError, AttributeError):
+        return list(_MODULE_TYPE_PROPERTIES_FALLBACK)
+
+
+# Sentinel used to distinguish "attribute missing from record" from a genuine
+# None/null value returned by NetBox.  When a property is in the schema-derived
+# comparison list but was not fetched by the GraphQL query, getattr returns this
+# sentinel and the property is skipped to avoid false-positive change detection.
+_MISSING = object()
 
 # Supported image file extensions for module-type image uploads
 IMAGE_EXTENSIONS = {
@@ -101,6 +155,21 @@ def _image_dir_for_yaml(src_file: str, src_segment: str, dst_segment: str) -> "P
 # from pynetbox import RequestError as APIRequestError
 
 
+def _count_actionable_component_changes(changes, remove_components):
+    """Return the count of changes in *changes* that will issue an API call.
+
+    Non-removal changes always qualify; removal changes only qualify when
+    *remove_components* is enabled.  Removal-only diffs with the flag off
+    issue zero API calls and must not be treated as attempted.
+    """
+    return sum(
+        1
+        for c in changes
+        if c.change_type in (ChangeType.COMPONENT_CHANGED, ChangeType.COMPONENT_ADDED)
+        or (remove_components and c.change_type == ChangeType.COMPONENT_REMOVED)
+    )
+
+
 class NetBox:
     """Interface to the NetBox API for importing device and module types."""
 
@@ -116,13 +185,18 @@ class NetBox:
             components_added=0,
             manufacturer=0,
             module_added=0,
+            module_updated=0,
+            module_update_failed=0,
+            module_partial_update=0,
             rack_type_added=0,
             rack_type_updated=0,
             images=0,
             properties_updated=0,
             components_updated=0,
             components_removed=0,
+            device_types_failed=0,
         )
+        self.outcomes = OutcomeRegistry()
         self.url = settings.NETBOX_URL
         self.token = settings.NETBOX_TOKEN
         self.handle = handle
@@ -132,6 +206,7 @@ class NetBox:
         self.new_filters = False
         self.m2m_front_ports = False  # True for NetBox >= 4.5 (M2M port mappings)
         self.rack_types = False
+        self.force_resolve_conflicts = False
         self.connect_api()
         self.verify_compatibility()
         self.graphql = NetBoxGraphQLClient(
@@ -158,6 +233,14 @@ class NetBox:
             )
         except GraphQLError as e:
             system_exit(f"GraphQL error fetching device types: {e}")
+        self._change_detector: ChangeDetector | None = None
+
+    @property
+    def change_detector(self) -> "ChangeDetector":
+        """Lazily initialised, reused :class:`ChangeDetector` instance."""
+        if self._change_detector is None:
+            self._change_detector = ChangeDetector(self.device_types, self.handle)
+        return self._change_detector
 
     def connect_api(self):
         """Connect to the NetBox API using the stored URL and token credentials."""
@@ -202,6 +285,17 @@ class NetBox:
                 f"Connection error while connecting to NetBox at {self.url}: {e}\n"
                 f"Hint: Verify that NetBox is running and reachable at {self.url}."
             )
+        except pynetbox.core.query.RequestError as e:
+            endpoint = getattr(e, "base", self.url)
+            status = getattr(e.req, "status_code", "?") if hasattr(e, "req") else "?"
+            reason = getattr(e.req, "reason", "") if hasattr(e, "req") else ""
+            body = str(getattr(e, "error", "") or "").strip()[:500]
+            details = f"HTTP {status} {reason}".strip()
+            msg = f"NetBox returned an error connecting to {endpoint} ({details})."
+            if body:
+                msg += f"\nResponse body (may be from an intermediate proxy):\n{body}"
+            msg += f"\nHint: Verify that {self.url} is reachable and not blocked by a proxy."
+            system_exit(msg)
         _raw = [int(re.sub(r"\D.*", "", x.strip()) or "0") for x in nb_version.split(".")]
         version_split = (_raw + [0, 0])[:2]  # pad to (major, minor) to guard against single-component strings
 
@@ -306,6 +400,200 @@ class NetBox:
                 del device_type[i]
         return saved_images
 
+    def _try_resolve_and_retry_device_type_update(self, dt, device_type, updates, error):
+        """Classify a failed device-type PATCH and, if safe, remediate then retry.
+
+        Inspects *error* via :func:`classify_device_type_update_failure`.  When
+        the failure is a recognised constraint, blocking templates exist, AND
+        no live devices reference this type, AND the operator has opted in via
+        ``--force-resolve-conflicts``, the remediation steps are executed and
+        the original PATCH is retried once.  Otherwise an actionable hint is
+        logged and ``False`` is returned (the caller will count this as a
+        failure via :meth:`_log_device_type_change_outcome`).
+
+        Args:
+            dt: pynetbox device-type record being updated.
+            device_type (dict): Parsed YAML device-type dict.
+            updates (dict): PATCH payload that previously failed.
+            error: ``pynetbox.RequestError`` instance from the failed PATCH.
+
+        Returns:
+            tuple[bool, FailureResolution | None]: ``(retry_succeeded, resolution)``
+            where ``resolution`` is the classifier's output (or ``None`` if the
+            classifier itself raised), useful for downstream reporting.
+        """
+        try:
+            resolution = classify_device_type_update_failure(
+                error.error,
+                netbox=self.netbox,
+                device_type_id=dt.id,
+                device_type_yaml=device_type,
+                new_filters=self.new_filters,
+            )
+        except Exception as exc:  # defensive: classifier must never break the run
+            self.handle.verbose_log(f"Failure classifier raised {type(exc).__name__}: {exc}")
+            return False, None
+
+        if resolution.kind == FailureKind.UNHANDLED:
+            return False, resolution
+
+        # Build a structured operator-facing log so the constraint and its
+        # remediation path are crystal clear.
+        if resolution.blocking_objects:
+            blockers = ", ".join(resolution.blocking_objects[:10])
+            if len(resolution.blocking_objects) > 10:
+                blockers += f", … (+{len(resolution.blocking_objects) - 10} more)"
+            self.handle.log(f"Constraint analysis for {dt.model}: blocked by {blockers}")
+        if resolution.description:
+            self.handle.log(f"  {resolution.description}")
+        if resolution.hint:
+            self.handle.log(f"  Hint: {resolution.hint}")
+
+        if resolution.kind == FailureKind.MANUAL_REQUIRED or not resolution.is_actionable:
+            return False, resolution
+
+        if not self.force_resolve_conflicts:
+            return False, resolution
+
+        # Opt-in destructive remediation.
+        self.handle.log(
+            f"Auto-resolving constraint for {dt.model} "
+            f"(--force-resolve-conflicts; {len(resolution.remediation_steps)} step(s))"
+        )
+        try:
+            for step in resolution.remediation_steps:
+                step()
+        except Exception as exc:
+            self.handle.log(f"Auto-resolve failed for {dt.model}: {exc}")
+            return False, resolution
+
+        # Retry the original PATCH exactly once.
+        try:
+            _retry_on_connection_error(
+                self.netbox.dcim.device_types.update,
+                [{"id": dt.id, **updates}],
+            )
+            dt.update(updates)
+            return True, resolution
+        except pynetbox.RequestError as e:
+            self.handle.log(f"Retry after auto-resolve still failed for {dt.model}: {e.error}")
+            return False, resolution
+        except _RETRYABLE_EXCEPTIONS as e:
+            self.handle.log(f"Connection error during retry after auto-resolve for {dt.model}: {e}")
+            return False, resolution
+
+    def _log_device_type_change_outcome(
+        self,
+        dt,
+        dt_change,
+        *,
+        property_attempted,
+        property_succeeded,
+        component_delta,
+        actionable_count,
+        failure_resolution=None,
+    ):
+        """Emit the right post-update log for an existing device type.
+
+        Distinguishes "actually updated", "partial update" (property PATCH
+        failed but components ran, or only some component changes succeeded),
+        and "completely failed" (PATCH was the only action and it failed, or
+        component API calls were issued but all failed) so the operator-visible
+        log no longer reports "Device Type Updated" when nothing was applied.
+
+        When the operation failed or was partial, also records a structured
+        outcome into :attr:`outcomes` so the end-of-run summary can render an
+        itemised report.
+
+        Args:
+            dt: pynetbox device-type record.
+            dt_change: ChangeEntry for this device-type.
+            property_attempted (bool): True if a property PATCH was issued.
+            property_succeeded (bool): True if the property PATCH (or its retry)
+                applied cleanly.
+            component_delta (int): Number of component operations that succeeded
+                (sum of counter deltas for components_updated, components_added,
+                components_removed after the API calls).
+            actionable_count (int): Number of component changes that issued API
+                calls (non-removal changes, or removals with --remove-components
+                enabled).
+            failure_resolution: Optional :class:`FailureResolution` whose
+                ``description``, ``blocking_objects`` and ``hint`` will be
+                attached to the registry record when the update failed.
+        """
+        identity = f"{dt.manufacturer.name}/{dt.model}"
+        component_attempted = actionable_count > 0
+        component_succeeded = component_delta > 0
+        something_applied = property_succeeded or component_succeeded
+        if something_applied:
+            is_full_success = (not property_attempted or property_succeeded) and (
+                not component_attempted or component_delta == actionable_count
+            )
+            if is_full_success:
+                if component_succeeded and not property_succeeded:
+                    # Component-only update: no property change was attempted or needed.
+                    self.counter.update({"device_types_component_updates": 1})
+                prop_count = 1 if property_succeeded else 0
+                comp_suffix = "; skipping component creation." if component_delta == 0 else "."
+                self.handle.verbose_log(
+                    f"Device Type Updated: {dt.manufacturer.name} - {dt.model} - {dt.id}. "
+                    f"Applied {prop_count} property and {component_delta} component change(s)" + comp_suffix
+                )
+            else:
+                if component_delta > 0:
+                    self.counter.update({"device_types_component_updates": 1})
+                reason_parts = []
+                if property_attempted and not property_succeeded:
+                    reason_parts.append("Property PATCH failed")
+                if component_attempted:
+                    if component_delta < actionable_count:
+                        reason_parts.append(f"applied {component_delta} of {actionable_count} component change(s)")
+                    else:
+                        reason_parts.append(f"applied {component_delta} component change(s)")
+                reason = "; ".join(reason_parts) + "." if reason_parts else "Partial update."
+                self.handle.verbose_log(
+                    f"Device Type Partially Updated: {dt.manufacturer.name} - {dt.model} - {dt.id}. {reason}"
+                )
+                self.outcomes.record(
+                    EntityKind.DEVICE_TYPE,
+                    identity,
+                    Outcome.PARTIAL,
+                    reason=reason,
+                    blocking_objects=(failure_resolution.blocking_objects if failure_resolution else None),
+                    hint=(failure_resolution.hint if failure_resolution else None),
+                )
+        elif property_attempted or component_attempted:
+            self.counter.update({"device_types_failed": 1})
+            self.handle.log(
+                f"Device Type Update Failed: {dt.manufacturer.name} - {dt.model} - {dt.id}. "
+                f"Attempted {1 if property_attempted else 0} property PATCH and "
+                f"{actionable_count} component change(s); "
+                "no changes were applied (see error above)."
+            )
+            self.outcomes.record(
+                EntityKind.DEVICE_TYPE,
+                identity,
+                Outcome.FAILED,
+                reason=(
+                    failure_resolution.description
+                    if failure_resolution
+                    else (
+                        "Property PATCH and component updates failed."
+                        if property_attempted and component_attempted
+                        else "Property PATCH failed."
+                        if property_attempted
+                        else "Component updates failed."
+                    )
+                ),
+                blocking_objects=(failure_resolution.blocking_objects if failure_resolution else None),
+                hint=(failure_resolution.hint if failure_resolution else None),
+            )
+        else:
+            self.handle.verbose_log(
+                f"Device Type Cached: {dt.manufacturer.name} - {dt.model} - {dt.id}. "
+                "No property or component changes applied."
+            )
+
     def _handle_existing_device_type(
         self,
         dt,
@@ -352,6 +640,12 @@ class NetBox:
             return
 
         if dt_change is not None:
+            property_attempted = False
+            property_succeeded = False
+            component_delta = 0
+            actionable_count = 0
+            failure_resolution = None
+
             # Apply property changes (exclude image properties — uploads are handled separately)
             if dt_change.property_changes:
                 updates = {
@@ -360,13 +654,24 @@ class NetBox:
                     if pc.property_name not in ("front_image", "rear_image")
                 }
                 if updates:
+                    property_attempted = True
                     try:
                         _retry_on_connection_error(self.netbox.dcim.device_types.update, [{"id": dt.id, **updates}])
                         dt.update(updates)  # keep local cache in sync
                         self.counter.update({"properties_updated": 1})
+                        property_succeeded = True
                         self.handle.verbose_log(f"Updated device type {dt.model} properties: {list(updates.keys())}")
                     except pynetbox.RequestError as e:
                         self.handle.log(f"Error updating device type {dt.model}: {e.error}")
+                        retried_ok, failure_resolution = self._try_resolve_and_retry_device_type_update(
+                            dt, device_type, updates, e
+                        )
+                        if retried_ok:
+                            self.counter.update({"properties_updated": 1})
+                            property_succeeded = True
+                            self.handle.verbose_log(
+                                f"Updated device type {dt.model} properties after auto-resolve: {list(updates.keys())}"
+                            )
                     except _RETRYABLE_EXCEPTIONS as e:
                         self.handle.log(
                             f"Connection error updating device type {dt.model} after {_MAX_RETRIES} retries: {e}"
@@ -374,6 +679,12 @@ class NetBox:
 
             # Apply component changes
             if dt_change.component_changes:
+                actionable_count = _count_actionable_component_changes(dt_change.component_changes, remove_components)
+                before_components = (
+                    self.counter["components_updated"],
+                    self.counter["components_added"],
+                    self.counter["components_removed"],
+                )
                 self.device_types.update_components(
                     device_type,
                     dt.id,
@@ -382,13 +693,22 @@ class NetBox:
                 )
                 if remove_components:
                     self.device_types.remove_components(dt.id, dt_change.component_changes, parent_type="device")
+                after_components = (
+                    self.counter["components_updated"],
+                    self.counter["components_added"],
+                    self.counter["components_removed"],
+                )
+                component_delta = sum(after_components) - sum(before_components)
 
-        if dt_change is not None:
-            self.handle.verbose_log(
-                f"Device Type Updated: {dt.manufacturer.name} - {dt.model} - {dt.id}. "
-                f"Applied {len(dt_change.property_changes or [])} property and "
-                f"{len(dt_change.component_changes or [])} component change(s); "
-                "skipping component creation."
+            # Distinguish full update, partial, and complete failure.
+            self._log_device_type_change_outcome(
+                dt,
+                dt_change,
+                property_attempted=property_attempted,
+                property_succeeded=property_succeeded,
+                component_delta=component_delta,
+                actionable_count=actionable_count,
+                failure_resolution=failure_resolution,
             )
         else:
             self.handle.verbose_log(
@@ -441,8 +761,6 @@ class NetBox:
             self.device_types.create_interfaces(device_type["interfaces"], dt_id)
         if "power-ports" in device_type:
             self.device_types.create_power_ports(device_type["power-ports"], dt_id)
-        if "power-port" in device_type:
-            self.device_types.create_power_ports(device_type["power-port"], dt_id)
         if "console-ports" in device_type:
             self.device_types.create_console_ports(device_type["console-ports"], dt_id)
         if "power-outlets" in device_type:
@@ -676,12 +994,64 @@ class NetBox:
                 new_module_types.append(module_type)
         return new_module_types
 
+    def _log_module_property_diffs(self, mfr_slug, model, fields_info, component_changes=None):
+        """Emit diff-u style lines for changed module type properties and component changes.
+
+        Args:
+            mfr_slug (str): Manufacturer slug.
+            model (str): Module type model name.
+            fields_info (list[tuple]): List of ``(field, old_val, new_val)`` tuples.
+            component_changes (list | None): Optional list of ComponentChange objects.
+        """
+        self.handle.verbose_log(f"  ~ {mfr_slug}/{model}")
+        if fields_info:
+            self.handle.verbose_log("    Properties:")
+            log_property_diffs(fields_info, self.handle.verbose_log)
+        if component_changes:
+            added = [c for c in component_changes if c.change_type == ChangeType.COMPONENT_ADDED]
+            changed = [c for c in component_changes if c.change_type == ChangeType.COMPONENT_CHANGED]
+            removed = [c for c in component_changes if c.change_type == ChangeType.COMPONENT_REMOVED]
+            if added:
+                self.handle.verbose_log(f"      + {len(added)} new component(s)")
+                for comp in added:
+                    self.handle.verbose_log(f"        + {comp.component_type}: {comp.component_name}")
+            if changed:
+                self.handle.verbose_log(f"      ~ {len(changed)} changed component(s)")
+                for comp in changed:
+                    self.handle.verbose_log(f"        ~ {comp.component_type}: {comp.component_name}")
+                    log_property_diffs(
+                        [(pc.property_name, pc.old_value, pc.new_value) for pc in comp.property_changes],
+                        self.handle.verbose_log,
+                        "            ",
+                    )
+            if removed:
+                self.handle.verbose_log(f"      - {len(removed)} component(s) present in NetBox but absent from YAML")
+                for comp in removed:
+                    self.handle.verbose_log(f"        - {comp.component_type}: {comp.component_name}")
+
+    def _module_type_has_missing_components(self, module_type, existing_module, component_keys):
+        """Return True if any YAML-defined components are absent from the existing module type in NetBox."""
+        for component_key in component_keys:
+            components = module_type.get(component_key)
+            if not components:
+                continue
+            endpoint_attr, cache_name = ENDPOINT_CACHE_MAP[component_key]
+            endpoint = getattr(self.netbox.dcim, endpoint_attr)
+            existing_components = self.device_types._get_cached_or_fetch(
+                cache_name, existing_module.id, "module", endpoint
+            )
+            requested_names = {c.get("name") for c in components if c.get("name")}
+            if any(name not in existing_components for name in requested_names):
+                return True
+        return False
+
     def filter_actionable_module_types(self, module_types, all_module_types, only_new=False):
         """Determine which module types need to be created or updated in NetBox.
 
         For ``only_new=True``, returns only module types absent from NetBox. Otherwise,
-        bulk-preloads component caches for all existing module types and includes any
-        whose images or components differ from NetBox.
+        ensures the component cache is populated via the global GraphQL preload (running
+        it on demand if device-type processing already ran it) and includes any module
+        types whose images, scalar properties, or components differ from NetBox.
 
         Args:
             module_types (list[dict]): Parsed YAML module-type dicts.
@@ -689,39 +1059,40 @@ class NetBox:
             only_new (bool): If True, skip change detection and return only truly new entries.
 
         Returns:
-            tuple[list[dict], dict]: Actionable module types and existing-image mapping
-                ``{module_type_id: set_of_image_names}``.
+            tuple[list[dict], dict, list]: Three-element tuple:
+
+            - Actionable module types (list[dict]) to be created or updated.
+            - Existing-image mapping ``{module_type_id: set_of_image_names}``.
+            - Changed-property log: list of ``(mfr_slug, model, fields_info,
+              comp_changes)`` tuples, one entry per modified module type, used
+              for diff-u output via :meth:`log_module_type_changes`.
         """
         if not module_types:
-            return [], {}
+            return [], {}, []
 
         if only_new:
-            return self.filter_new_module_types(module_types, all_module_types), {}
+            return self.filter_new_module_types(module_types, all_module_types), {}, []
 
         module_type_existing_images = self._fetch_module_type_existing_images()
 
         actionable_module_types = []
-        component_keys = (
-            "interfaces",
-            "power-ports",
-            "console-ports",
-            "power-outlets",
-            "console-server-ports",
-            "rear-ports",
-            "front-ports",
-        )
+        # Collects (mfr_slug, model, [(field, old_val, new_val)]) for diff-u logging.
+        changed_property_log = []
 
-        # Bulk-preload components for all existing module types so the per-module
-        # loop below hits the cache instead of issuing individual API calls.
+        # Ensure the component cache is populated with GraphQL data (which carries correct
+        # mappings for front-port templates).  The global preload already ran during device-type
+        # processing in normal mode; this call is a no-op then.  When no device types were
+        # present (e.g. vendor-filtered runs or --only-new was used for device types) the
+        # preload is triggered here so module-type comparisons still hit accurate cache data.
+        if not self.device_types._global_preload_done:
+            self.device_types.preload_all_components()
+
         existing_module_map = {}
-        existing_module_ids = set()
         for module_type in module_types:
             existing_module = self._find_existing_module_type(module_type, all_module_types)
             existing_module_map[id(module_type)] = existing_module
-            if existing_module is not None:
-                existing_module_ids.add(existing_module.id)
-        if existing_module_ids:
-            self.device_types.preload_module_type_components(existing_module_ids, component_keys)
+
+        detector = self.change_detector
 
         for module_type in module_types:
             existing_module = existing_module_map[id(module_type)]
@@ -731,30 +1102,49 @@ class NetBox:
 
             existing_images = module_type_existing_images.get(existing_module.id, set())
             image_files = self._discover_module_image_files(module_type.get("src", ""))
-            if any(os.path.splitext(os.path.basename(path))[0] not in existing_images for path in image_files):
-                actionable_module_types.append(module_type)
-                continue
+            image_changed = any(
+                os.path.splitext(os.path.basename(path))[0] not in existing_images for path in image_files
+            )
 
-            has_missing_components = False
-            for component_key in component_keys:
-                components = module_type.get(component_key)
-                if not components:
+            changed_fields_info = []
+            for f in _load_module_type_properties():
+                if f not in module_type:
                     continue
+                nb_val = getattr(existing_module, f, _MISSING)
+                if nb_val is _MISSING:
+                    # Field not fetched from NetBox yet; skip to avoid false positives.
+                    continue
+                if not values_equal(module_type[f], nb_val):
+                    changed_fields_info.append((f, nb_val, module_type[f]))
 
-                endpoint_attr, cache_name = ENDPOINT_CACHE_MAP[component_key]
-                endpoint = getattr(self.netbox.dcim, endpoint_attr)
-                existing_components = self.device_types._get_cached_or_fetch(
-                    cache_name, existing_module.id, "module", endpoint
+            component_changes = detector._compare_components(module_type, existing_module.id, parent_type="module")
+
+            if changed_fields_info or component_changes:
+                changed_property_log.append(
+                    (
+                        module_type["manufacturer"]["slug"],
+                        module_type["model"],
+                        changed_fields_info,
+                        component_changes,
+                    )
                 )
-                requested_names = {component.get("name") for component in components if component.get("name")}
-                if any(name not in existing_components for name in requested_names):
-                    has_missing_components = True
-                    break
 
-            if has_missing_components:
+            if image_changed or changed_fields_info or component_changes:
                 actionable_module_types.append(module_type)
 
-        return actionable_module_types, module_type_existing_images
+        return actionable_module_types, module_type_existing_images, changed_property_log
+
+    def log_module_type_changes(self, changed_property_log):
+        """Emit verbose diff output for modified module types.
+
+        Args:
+            changed_property_log: List of ``(mfr_slug, model, fields_info, comp_changes)``
+                tuples as returned by :meth:`filter_actionable_module_types`.
+        """
+        if changed_property_log:
+            self.handle.verbose_log("MODIFIED MODULE TYPES:")
+            for mfr_slug, model, fields_info, comp_changes in changed_property_log:
+                self._log_module_property_diffs(mfr_slug, model, fields_info, comp_changes)
 
     def _fetch_module_type_existing_images(self):
         """Query NetBox for all image attachments on module types via GraphQL and return a mapping.
@@ -768,27 +1158,188 @@ class NetBox:
         )
         return module_type_existing_images
 
-    def _process_single_module_type(self, curr_mt, src_file, all_module_types, module_type_existing_images, only_new):
-        """Find or create a single module type and create its component templates.
+    def _try_update_module_type(self, curr_mt, module_type_res, src_file):
+        """Apply pending field updates to an existing module type in NetBox.
+
+        Returns:
+            tuple[bool, bool]: ``(success, updated)`` where *success* is False on error and
+                *updated* is True when at least one field was actually patched.
+        """
+        updates = {}
+        for field in _load_module_type_properties():
+            if field not in curr_mt:
+                continue
+            current_value = getattr(module_type_res, field, _MISSING)
+            if current_value is _MISSING:
+                continue
+            if not values_equal(curr_mt[field], current_value):
+                updates[field] = curr_mt[field]
+        if not updates:
+            return True, False
+        try:
+            _retry_on_connection_error(self.netbox.dcim.module_types.update, [{"id": module_type_res.id, **updates}])
+            self.handle.verbose_log(
+                f"Module Type Updated: {module_type_res.manufacturer.name} - "
+                f"{module_type_res.model} - {module_type_res.id} "
+                f"(changed: {list(updates.keys())})"
+            )
+        except pynetbox.RequestError as excep:
+            self.handle.log(f"Error updating Module Type: {excep.error} (Context: {src_file})")
+            return False, False
+        except _RETRYABLE_EXCEPTIONS as e:
+            self.handle.log(
+                f"Connection error updating Module Type after {_MAX_RETRIES} retries: {e} (Context: {src_file})"
+            )
+            return False, False
+        return True, True
+
+    def _create_module_type_components(self, curr_mt, module_type_id, src_file):
+        """Create all component templates for a newly created module type.
+
+        Args:
+            curr_mt (dict): Parsed YAML module-type dict.
+            module_type_id (int): ID of the newly created module type in NetBox.
+            src_file (str): Source file path for error context.
+        """
+        component_map = {
+            "interfaces": self.device_types.create_module_interfaces,
+            "power-ports": self.device_types.create_module_power_ports,
+            "console-ports": self.device_types.create_module_console_ports,
+            "power-outlets": self.device_types.create_module_power_outlets,
+            "console-server-ports": self.device_types.create_module_console_server_ports,
+            "rear-ports": self.device_types.create_module_rear_ports,
+            "front-ports": self.device_types.create_module_front_ports,
+        }
+        for key, create_fn in component_map.items():
+            if key in curr_mt:
+                create_fn(curr_mt[key], module_type_id, context=src_file)
+
+    def _apply_module_type_component_updates(
+        self, curr_mt, module_type_res, properties_updated, remove_components, patch_ok=True
+    ):
+        """Detect and apply component changes for an existing module type in update mode.
+
+        Args:
+            curr_mt (dict): Parsed YAML module-type dict.
+            module_type_res: NetBox module type record.
+            properties_updated (bool): Whether scalar properties were already patched (used to
+                avoid double-counting the module as updated).
+            remove_components (bool): When True, removed components are deleted from NetBox.
+            patch_ok (bool): Whether the preceding scalar PATCH call succeeded (or was a no-op).
+                When False the property drift is still present; a component-only reconciliation
+                must not be recorded as a full ``module_updated`` success.
+        """
+        if not self.device_types._global_preload_done:
+            self.device_types.preload_all_components()
+        identity = f"{module_type_res.manufacturer.name}/{module_type_res.model}"
+        component_changes = self.change_detector._compare_components(curr_mt, module_type_res.id, parent_type="module")
+        if component_changes:
+            actionable_count = _count_actionable_component_changes(component_changes, remove_components)
+            before_updated = self.counter["components_updated"]
+            before_added = self.counter["components_added"]
+            before_removed = self.counter["components_removed"]
+            self.device_types.update_components(curr_mt, module_type_res.id, component_changes, parent_type="module")
+            if remove_components:
+                self.device_types.remove_components(module_type_res.id, component_changes, parent_type="module")
+            component_delta = (
+                self.counter["components_updated"]
+                - before_updated
+                + self.counter["components_added"]
+                - before_added
+                + self.counter["components_removed"]
+                - before_removed
+            )
+            if actionable_count == 0:
+                if properties_updated and patch_ok:
+                    self.counter["module_updated"] += 1
+                elif not patch_ok:
+                    self.counter["module_update_failed"] += 1
+                    self.outcomes.record(
+                        EntityKind.MODULE_TYPE,
+                        identity,
+                        Outcome.FAILED,
+                        reason="Scalar PATCH failed; no component changes were actionable.",
+                    )
+            elif component_delta == 0:
+                if properties_updated and patch_ok:
+                    # Properties patched successfully; components were attempted but
+                    # none changed — treat as a partial success, not a full failure.
+                    self.counter["module_partial_update"] += 1
+                else:
+                    self.counter["module_update_failed"] += 1
+                    reason = (
+                        "Scalar PATCH failed; component reconciliation ran but applied 0 changes."
+                        if not patch_ok
+                        else "Component reconciliation ran but applied 0 changes."
+                    )
+                    self.outcomes.record(
+                        EntityKind.MODULE_TYPE,
+                        identity,
+                        Outcome.FAILED,
+                        reason=reason,
+                    )
+            elif component_delta == actionable_count and patch_ok:
+                self.counter["module_updated"] += 1
+            else:
+                self.counter["module_partial_update"] += 1
+        elif properties_updated and patch_ok:
+            self.counter["module_updated"] += 1
+        elif not patch_ok:
+            self.counter["module_update_failed"] += 1
+            self.outcomes.record(
+                EntityKind.MODULE_TYPE,
+                identity,
+                Outcome.FAILED,
+                reason="Scalar PATCH failed; no component changes detected.",
+            )
+
+    def _process_single_module_type(
+        self, curr_mt, src_file, all_module_types, module_type_existing_images, only_new, remove_components=False
+    ):
+        """Find or create a single module type and create or update its component templates.
+
+        For new module types all component templates are created directly.  For existing
+        module types in update mode (``only_new=False``) scalar properties are patched and
+        component changes (additions, modifications) are applied via
+        :meth:`DeviceTypes.update_components`.
 
         Args:
             curr_mt (dict): Parsed YAML module-type dict (with ``src`` key already removed).
             src_file (str): Source file path for error messages and image discovery.
             all_module_types (dict): Existing module types cache; updated in-place on creation.
             module_type_existing_images (dict): Existing image map by module type ID.
-            only_new (bool): When True, skip component creation for existing module types.
+            only_new (bool): When True, skip all updates for existing module types.
+            remove_components (bool): When True, components absent from the YAML are deleted.
 
         Returns:
             bool: False if an error occurred and the caller should skip to the next iteration;
                 True otherwise.
         """
         is_new = False
+        properties_updated = False
+        patch_ok = True
         module_type_res = self._find_existing_module_type(curr_mt, all_module_types)
         if module_type_res is not None:
             self.handle.verbose_log(
                 f"Module Type Cached: {module_type_res.manufacturer.name} - "
                 + f"{module_type_res.model} - {module_type_res.id}"
             )
+            # Upload images before the scalar PATCH so attachments are created
+            # even if the property update later fails (module already exists in
+            # NetBox so the attachment POST can reference its id immediately).
+            self._upload_module_type_images(module_type_res, src_file, module_type_existing_images)
+            if not only_new:
+                ok, properties_updated = self._try_update_module_type(curr_mt, module_type_res, src_file)
+                patch_ok = ok
+                if not ok:
+                    # Scalar PATCH failed; continue with component reconciliation so a
+                    # transient property update failure does not block component sync.
+                    # Outcome counter is determined by _apply_module_type_component_updates.
+                    self.handle.verbose_log(
+                        f"Scalar PATCH failed for module type "
+                        f"{module_type_res.manufacturer.name} - {module_type_res.model}; "
+                        "continuing with component reconciliation."
+                    )
         else:
             try:
                 module_type_res = _retry_on_connection_error(self.netbox.dcim.module_types.create, curr_mt)
@@ -809,33 +1360,20 @@ class NetBox:
                 )
                 return False
 
-        # Upload images for both cached and newly created module types
-        self._upload_module_type_images(module_type_res, src_file, module_type_existing_images)
-
         if only_new and not is_new:
             return True
 
-        # Module component keys often use hyphens in YAML
-        if "interfaces" in curr_mt:
-            self.device_types.create_module_interfaces(curr_mt["interfaces"], module_type_res.id, context=src_file)
-        if "power-ports" in curr_mt:
-            self.device_types.create_module_power_ports(curr_mt["power-ports"], module_type_res.id, context=src_file)
-        if "console-ports" in curr_mt:
-            self.device_types.create_module_console_ports(
-                curr_mt["console-ports"], module_type_res.id, context=src_file
+        if is_new:
+            # New module type: upload images and create all component templates directly.
+            self._upload_module_type_images(module_type_res, src_file, module_type_existing_images)
+            self._create_module_type_components(curr_mt, module_type_res.id, src_file)
+        else:
+            # Existing module type in update mode: detect and apply component changes.
+            # The global GraphQL cache is already populated, so _compare_components is a
+            # pure dict-lookup with no API calls.
+            self._apply_module_type_component_updates(
+                curr_mt, module_type_res, properties_updated, remove_components, patch_ok=patch_ok
             )
-        if "power-outlets" in curr_mt:
-            self.device_types.create_module_power_outlets(
-                curr_mt["power-outlets"], module_type_res.id, context=src_file
-            )
-        if "console-server-ports" in curr_mt:
-            self.device_types.create_module_console_server_ports(
-                curr_mt["console-server-ports"], module_type_res.id, context=src_file
-            )
-        if "rear-ports" in curr_mt:
-            self.device_types.create_module_rear_ports(curr_mt["rear-ports"], module_type_res.id, context=src_file)
-        if "front-ports" in curr_mt:
-            self.device_types.create_module_front_ports(curr_mt["front-ports"], module_type_res.id, context=src_file)
         return True
 
     def create_module_types(
@@ -845,6 +1383,7 @@ class NetBox:
         only_new=False,
         all_module_types=None,
         module_type_existing_images=None,
+        remove_components=False,
     ):
         """Create or update module types and their component templates in NetBox.
 
@@ -858,6 +1397,7 @@ class NetBox:
             only_new (bool): If True, skip component updates for existing module types.
             all_module_types (dict | None): Existing module types cache; fetched if None.
             module_type_existing_images (dict | None): Existing image map; fetched if None.
+            remove_components (bool): When True, components absent from the YAML are deleted.
         """
         if not module_types:
             return
@@ -879,6 +1419,7 @@ class NetBox:
                 all_module_types,
                 module_type_existing_images,
                 only_new,
+                remove_components=remove_components,
             ):
                 continue
 
@@ -1036,7 +1577,6 @@ class NetBox:
 ENDPOINT_CACHE_MAP = {
     "interfaces": ("interface_templates", "interface_templates"),
     "power-ports": ("power_port_templates", "power_port_templates"),
-    "power-port": ("power_port_templates", "power_port_templates"),
     "console-ports": ("console_port_templates", "console_port_templates"),
     "power-outlets": ("power_outlet_templates", "power_outlet_templates"),
     "console-server-ports": (
@@ -1070,6 +1610,12 @@ class _FrontPortRecordWithMappings:
     __slots__ = ("_record", "_mappings_canonical")
 
     def __init__(self, record):
+        """Wrap *record* and pre-compute a canonical mappings list for ChangeDetector compatibility.
+
+        Normalises the ``mappings`` field (NetBox >= 4.5 list of ``PortTemplateMapping`` objects)
+        or the ``rear_port_position`` scalar (NetBox < 4.5) into a uniform list of dicts stored
+        in ``_mappings_canonical``.
+        """
         object.__setattr__(self, "_record", record)
         mappings_raw = getattr(record, "mappings", None)
         if mappings_raw is not None:
@@ -1103,11 +1649,12 @@ class _FrontPortRecordWithMappings:
                     }
                 ]
                 if rp_pos is not None
-                else []
+                else None  # Both mappings and rear_port_position absent; skip comparison.
             )
         object.__setattr__(self, "_mappings_canonical", canonical)
 
     def __getattr__(self, name):
+        """Delegate attribute access to the wrapped record."""
         return getattr(self._record, name)
 
 
@@ -1147,6 +1694,7 @@ class DeviceTypes:
         self.m2m_front_ports = m2m_front_ports
         self.max_threads = max_threads
         self.cached_components = {}
+        self._global_preload_done = False
         self._image_progress = None
         self.existing_device_types, self.existing_device_types_by_slug = self.get_device_types()
 
@@ -1181,19 +1729,59 @@ class DeviceTypes:
             ("module_bay_templates", "Module Bays"),
         ]
 
-    def _get_endpoint_totals(self, components):
-        """Return placeholder totals for component endpoints.
+    def _get_rest_component_count(self, endpoint_name):
+        """Return the REST API count for *endpoint_name*, or ``None`` on failure.
 
-        With GraphQL, counts are not fetched upfront — progress bars will
-        adjust when results arrive.
+        Issues a single lightweight ``?limit=1`` REST call that returns just the
+        total record count — no item data is transferred.  Used to validate that
+        subsequent GraphQL fetches returned the expected number of records.
+
+        Args:
+            endpoint_name (str): Component template endpoint name (e.g. ``"interface_templates"``).
+
+        Returns:
+            int | None: Total record count, or ``None`` if the request fails.
+        """
+        try:
+            return getattr(self.netbox.dcim, endpoint_name).count()
+        except Exception as exc:
+            self.handle.verbose_log(
+                f"REST count unavailable for {endpoint_name}; skipping GraphQL count verification: {exc}"
+            )
+            return None
+
+    def _get_endpoint_totals(self, components):
+        """Fetch REST record counts for each component endpoint in parallel.
+
+        Issues one lightweight ``?limit=1`` REST call per endpoint to obtain the
+        expected total before the GraphQL fetch begins.  These totals are later
+        used to detect silent truncation in :meth:`_fetch_global_endpoint_records`.
+
+        REST-only endpoints (see :attr:`REST_ONLY_ENDPOINTS`) are excluded because
+        their counts will be determined by the REST fetch itself.
 
         Args:
             components: Iterable of ``(endpoint_name, label)`` tuples.
 
         Returns:
-            dict: ``{endpoint_name: 0}`` for all endpoints.
+            dict: ``{endpoint_name: count_or_None}`` for graphql endpoints (``None``
+                preserves the "count unavailable" sentinel from
+                :meth:`_get_rest_component_count`), and ``0`` for REST-only endpoints
+                (whose authoritative count is established by the REST fetch itself).
         """
-        return {endpoint_name: 0 for endpoint_name, _label in components}
+        graphql_endpoints = [ep for ep, _label in components if ep not in self.REST_ONLY_ENDPOINTS]
+        totals = {ep: (0 if ep in self.REST_ONLY_ENDPOINTS else None) for ep, _label in components}
+
+        max_workers = max(1, min(len(graphql_endpoints), self.max_threads))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_ep = {executor.submit(self._get_rest_component_count, ep): ep for ep in graphql_endpoints}
+            for future in concurrent.futures.as_completed(future_to_ep):
+                ep = future_to_ep[future]
+                result = future.result()
+                if isinstance(result, int) and not isinstance(result, bool):
+                    totals[ep] = result
+
+        return totals
 
     def start_component_preload(self, progress=None):
         """Start concurrent component prefetch and return a preload job handle."""
@@ -1210,12 +1798,13 @@ class DeviceTypes:
                 task_ids = {
                     endpoint_name: progress.add_task(
                         f"Caching {label}",
-                        total=None,
+                        total=endpoint_totals.get(endpoint_name),
                     )
                     for endpoint_name, label in components
                 }
 
             def update_progress(endpoint_name, advance):
+                """Put a progress update onto the queue for the main thread to consume."""
                 progress_updates.put((endpoint_name, advance))
 
             futures = {
@@ -1223,7 +1812,7 @@ class DeviceTypes:
                     self._fetch_global_endpoint_records,
                     endpoint_name,
                     update_progress,
-                    endpoint_totals.get(endpoint_name, 0),
+                    endpoint_totals.get(endpoint_name),
                 )
                 for endpoint_name, _label in components
             }
@@ -1291,9 +1880,18 @@ class DeviceTypes:
                 break
 
         for endpoint_name, advance in updates.items():
+            if advance == 0:
+                continue
             task_id = task_ids.get(endpoint_name)
             if task_id is not None:
-                progress.update(task_id, advance=advance)
+                if advance < 0:
+                    # Rewind on retry: clamp completed at 0 to avoid negative bars.
+                    task = next((t for t in progress.tasks if t.id == task_id), None)
+                    if task is not None:
+                        new_completed = max(0, task.completed + advance)
+                        progress.update(task_id, completed=new_completed)
+                else:
+                    progress.update(task_id, advance=advance)
                 advanced = True
 
         return advanced
@@ -1368,9 +1966,11 @@ class DeviceTypes:
                 preload_job=preload_job,
                 progress=progress,
             )
+            self._global_preload_done = True
             return
 
         self._preload_global(components, progress_wrapper, progress=progress)
+        self._global_preload_done = True
 
     def _preload_track_progress(
         self,
@@ -1408,13 +2008,15 @@ class DeviceTypes:
             for endpoint_name in already_done:
                 try:
                     records_by_endpoint[endpoint_name] = future_map[endpoint_name].result()
+                except GraphQLCountMismatchError:
+                    raise
                 except Exception as exc:
                     self.handle.log(f"Preload failed for {endpoint_name}: {exc}")
-                    records_by_endpoint[endpoint_name] = []
+                    raise
                 if endpoint_name in task_ids:
                     try:
                         final_total = max(
-                            endpoint_totals.get(endpoint_name, 0),
+                            endpoint_totals.get(endpoint_name) or 0,
                             len(records_by_endpoint[endpoint_name]),
                             1,
                         )
@@ -1475,11 +2077,13 @@ class DeviceTypes:
                 pending.remove(endpoint_name)
                 try:
                     records_by_endpoint[endpoint_name] = future_map[endpoint_name].result()
+                except GraphQLCountMismatchError:
+                    raise
                 except Exception as exc:
                     self.handle.log(f"Preload failed for {endpoint_name}: {exc}")
-                    records_by_endpoint[endpoint_name] = []
+                    raise
                 final_total = max(
-                    endpoint_totals.get(endpoint_name, 0),
+                    endpoint_totals.get(endpoint_name) or 0,
                     len(records_by_endpoint[endpoint_name]),
                     1,
                 )
@@ -1495,8 +2099,17 @@ class DeviceTypes:
                             # Drop: endpoint already finalised; no task to advance.
                             continue
                         task_id = task_ids.get(endpoint_name)
-                        if task_id is not None:
-                            progress.update(task_id, advance=advance)
+                        if task_id is not None and advance != 0:
+                            if advance < 0:
+                                task = next(
+                                    (t for t in progress.tasks if t.id == task_id),
+                                    None,
+                                )
+                                if task is not None:
+                                    new_completed = max(0, task.completed + advance)
+                                    progress.update(task_id, completed=new_completed)
+                            else:
+                                progress.update(task_id, advance=advance)
                     except queue.Empty:
                         pass
                 else:
@@ -1524,9 +2137,11 @@ class DeviceTypes:
             self.handle.verbose_log(f"Pre-fetching {label}...")
             try:
                 records_by_endpoint[endpoint] = futures[endpoint].result()
+            except GraphQLCountMismatchError:
+                raise
             except Exception as exc:
                 self.handle.log(f"Preload failed for {label}: {exc}")
-                records_by_endpoint[endpoint] = []
+                raise
         return records_by_endpoint
 
     def _preload_global(self, components, progress_wrapper=None, preload_job=None, progress=None):
@@ -1551,6 +2166,7 @@ class DeviceTypes:
                     progress_updates = queue.Queue()
 
                     def update_progress(endpoint_name, advance):
+                        """Put a progress update onto the queue for the main-thread pump to consume."""
                         progress_updates.put((endpoint_name, advance))
 
                     futures = {
@@ -1558,7 +2174,7 @@ class DeviceTypes:
                             self._fetch_global_endpoint_records,
                             endpoint,
                             update_progress,
-                            endpoint_totals.get(endpoint, 0),
+                            endpoint_totals.get(endpoint),
                         )
                         for endpoint, _label in components
                     }
@@ -1568,7 +2184,7 @@ class DeviceTypes:
                             self._fetch_global_endpoint_records,
                             endpoint,
                             None,
-                            endpoint_totals.get(endpoint, 0),
+                            endpoint_totals.get(endpoint),
                         )
                         for endpoint, _label in components
                     }
@@ -1578,7 +2194,7 @@ class DeviceTypes:
                     task_ids = {
                         endpoint: progress.add_task(
                             f"Caching {label}",
-                            total=None,
+                            total=endpoint_totals.get(endpoint),
                         )
                         for endpoint, label in components
                     }
@@ -1623,8 +2239,15 @@ class DeviceTypes:
 
         Args:
             endpoint_name (str): Component template endpoint name (e.g. ``"interface_templates"``).
-            progress_callback (callable | None): Called with ``(endpoint_name, advance)`` once when done.
-            expected_total (int | None): Expected record count; reserved for callers, unused here.
+            progress_callback (callable | None): Called with ``(endpoint_name, advance)``
+                once per page during the GraphQL fetch (or once after the batch fetch
+                completes for REST endpoints).  *advance* is a positive integer equal to
+                the number of records on that page.  On a count-mismatch retry the
+                callback is invoked once with a **negative** advance to rewind the
+                progress bar by the same amount, keeping the display consistent across
+                attempts.
+            expected_total (int | None): Expected record count obtained from the REST API before the
+                GraphQL fetch.  If provided and the fetched count differs, a warning is logged.
 
         Returns:
             list: All component template records.
@@ -1638,10 +2261,46 @@ class DeviceTypes:
                 progress_callback(endpoint_name, len(records))
             return records
 
-        on_page = (lambda n: progress_callback(endpoint_name, n)) if progress_callback is not None else None
-        records = self.graphql.get_component_templates(endpoint_name, on_page=on_page)
-        if endpoint_name == "front_port_templates":
-            records = [_FrontPortRecordWithMappings(r) for r in records]
+        for attempt in range(_MAX_RETRIES + 1):
+            # Forward per-page advances LIVE so the progress bar moves while a
+            # large endpoint (e.g. interfaces, 100k+ records) is fetching.  Track
+            # fetched_this_attempt so that on a count-mismatch retry we can
+            # rewind by the same amount, keeping the bar consistent.
+            fetched_this_attempt = 0
+
+            def _live_advance(n):
+                nonlocal fetched_this_attempt
+                fetched_this_attempt += n
+                if progress_callback is not None and n:
+                    progress_callback(endpoint_name, n)
+
+            on_page = _live_advance if progress_callback is not None else None
+            records = self.graphql.get_component_templates(endpoint_name, on_page=on_page)
+            if endpoint_name == "front_port_templates":
+                records = [_FrontPortRecordWithMappings(r) for r in records]
+
+            if expected_total is not None and len(records) != expected_total:
+                if attempt < _MAX_RETRIES:
+                    backoff = _RETRY_BACKOFF[attempt]
+                    self.handle.log(
+                        f"WARNING: GraphQL returned {len(records)} {endpoint_name} "
+                        f"but REST API expected {expected_total}. "
+                        f"Retrying in {backoff}s (attempt {attempt + 1}/{_MAX_RETRIES})…"
+                    )
+                    if progress_callback is not None and fetched_this_attempt:
+                        # Rewind the bar so the next attempt's live advances do
+                        # not double-count.
+                        progress_callback(endpoint_name, -fetched_this_attempt)
+                    time.sleep(backoff)
+                    continue
+                raise GraphQLCountMismatchError(
+                    f"GraphQL returned {len(records)} {endpoint_name} "
+                    f"but REST API expected {expected_total} "
+                    f"after {_MAX_RETRIES} retries. "
+                    "Run aborted to prevent processing an incomplete component cache."
+                )
+            break
+
         return records
 
     @staticmethod
@@ -1682,7 +2341,8 @@ class DeviceTypes:
     def _get_filter_kwargs(self, parent_id, parent_type="device"):
         """Build endpoint filter keyword arguments for the given parent type and ID.
 
-        Selects the correct parameter name based on the NetBox version (``self.new_filters``).
+        Delegates to :mod:`core.compat` helpers so the version-compat logic
+        lives in exactly one place.
 
         Args:
             parent_id (int): ID of the device type or module type.
@@ -1692,12 +2352,9 @@ class DeviceTypes:
             dict: Filter kwargs to pass to a pynetbox endpoint's ``filter()`` method.
         """
         if parent_type == "device":
-            key = "device_type_id" if self.new_filters else "devicetype_id"
-            return {key: parent_id}
+            return device_type_filter_kwargs(parent_id, new_filters=self.new_filters)
         else:
-            # Module types: module_type_id (new) vs moduletype_id (old)
-            key = "module_type_id" if self.new_filters else "moduletype_id"
-            return {key: parent_id}
+            return module_type_filter_kwargs(parent_id, new_filters=self.new_filters)
 
     def _get_cached_or_fetch(self, cache_name, parent_id, parent_type, endpoint):
         """Return cached components or fall back to a targeted REST filter.
@@ -1736,7 +2393,7 @@ class DeviceTypes:
         ``filter()`` call per chunk of up to ``FILTER_CHUNK_SIZE`` module-type IDs
         (filtering by module_type_id=[...]) and distributes the returned items into
         per-module-type cache entries so that subsequent ``_get_cached_or_fetch``
-        calls hit the cache.
+        calls hit the cache.  All component types are fetched in parallel.
         """
         if not module_type_ids:
             return
@@ -1750,21 +2407,36 @@ class DeviceTypes:
             seen_endpoints.add(endpoint_attr)
             targets.append((endpoint_attr, cache_name))
 
-        filter_key = "module_type_id" if self.new_filters else "moduletype_id"
+        filter_key = module_type_filter_key(self.new_filters)
         id_list = sorted(module_type_ids)
 
-        for endpoint_attr, cache_name in targets:
-            endpoint = getattr(self.netbox.dcim, endpoint_attr)
+        # Pre-populate empty entries so cache hits return {} for IDs with no components.
+        for _, cache_name in targets:
             cache = self.cached_components.setdefault(cache_name, {})
-            # Pre-populate empty entries so cache hits return {} for IDs with no components
             for mid in id_list:
                 cache.setdefault(("module", mid), {})
+
+        def _fetch_one(endpoint_attr, cache_name):
+            """Fetch all module-type component records for *endpoint_attr* and populate *cache_name*."""
+            endpoint = getattr(self.netbox.dcim, endpoint_attr)
+            results = []
             for chunk in _chunked(id_list, FILTER_CHUNK_SIZE):
                 for item in endpoint.filter(**{filter_key: chunk}):
                     module_type = getattr(item, "module_type", None)
                     if module_type is None:
                         continue
-                    mid = module_type.id
+                    if cache_name == "front_port_templates":
+                        item = _FrontPortRecordWithMappings(item)
+                    results.append((module_type.id, item))
+            return cache_name, results
+
+        max_workers = max(1, min(len(targets), self.max_threads))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_one, ea, cn): (ea, cn) for ea, cn in targets}
+            for future in concurrent.futures.as_completed(futures):
+                cache_name, results = future.result()
+                cache = self.cached_components[cache_name]
+                for mid, item in results:
                     cache.setdefault(("module", mid), {})[item.name] = item
 
     def _create_generic(
@@ -2022,11 +2694,6 @@ class DeviceTypes:
         yaml_key = None
         if comp_type in yaml_data:
             yaml_key = comp_type
-        else:
-            for alias, canonical in COMPONENT_ALIASES.items():
-                if canonical == comp_type and alias in yaml_data:
-                    yaml_key = alias
-                    break
         if yaml_key is None:
             return
 
@@ -2241,6 +2908,7 @@ class DeviceTypes:
         """
 
         def link_ports(items, pid):
+            """Resolve power-port name references in *items* and persist the outlet templates for device type *pid*."""
             existing_pp = self._get_cached_or_fetch(
                 "power_port_templates",
                 pid,
@@ -2336,6 +3004,7 @@ class DeviceTypes:
         m2m = self.m2m_front_ports
 
         def link_rear_ports(items, pid):
+            """Resolve rear-port position references in *items* and persist the front port templates for *pid*."""
             existing_rp = self._get_cached_or_fetch(
                 "rear_port_templates",
                 pid,
@@ -2498,6 +3167,7 @@ class DeviceTypes:
         """Create power outlet templates for a module type, resolving power-port name references."""
 
         def link_ports(items, pid):
+            """Resolve power-port name references in *items* and persist the outlet templates for module type *pid*."""
             existing_pp = self._get_cached_or_fetch(
                 "power_port_templates",
                 pid,

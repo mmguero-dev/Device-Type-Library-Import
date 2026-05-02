@@ -6,12 +6,22 @@ compatible with the existing REST-based code in ``netbox_api.py``.
 """
 
 import threading
+import time
 
 import requests
 
 
 class GraphQLError(Exception):
     """Raised when a GraphQL query fails (HTTP error or GraphQL-level errors)."""
+
+
+class GraphQLCountMismatchError(GraphQLError):
+    """Raised when the number of records returned by GraphQL does not match the REST count.
+
+    This indicates a silent truncation in the GraphQL response — e.g. the server
+    returned far fewer records than it reports via the REST API.  The run is aborted
+    to prevent processing an incomplete cache.
+    """
 
 
 class DotDict(dict):
@@ -93,6 +103,8 @@ COMPONENT_TEMPLATE_FIELDS = {
         "enabled",
         "poe_mode",
         "poe_type",
+        "description",
+        "rf_role",
     ],
     "power_port_templates": [
         "id",
@@ -101,24 +113,30 @@ COMPONENT_TEMPLATE_FIELDS = {
         "maximum_draw",
         "allocated_draw",
         "label",
+        "description",
     ],
-    "console_port_templates": ["id", "name", "type", "label"],
-    "console_server_port_templates": ["id", "name", "type", "label"],
-    "power_outlet_templates": ["id", "name", "type", "feed_leg", "label"],
-    "rear_port_templates": ["id", "name", "type", "positions", "label"],
+    "console_port_templates": ["id", "name", "type", "label", "description"],
+    "console_server_port_templates": ["id", "name", "type", "label", "description"],
+    "power_outlet_templates": ["id", "name", "type", "feed_leg", "label", "description"],
+    "rear_port_templates": ["id", "name", "type", "positions", "label", "description", "color"],
     "front_port_templates": [
         "id",
         "name",
         "type",
         "label",
+        "description",
+        "color",
         "mappings { id front_port_position rear_port_position rear_port { id name } }",
     ],
-    "device_bay_templates": ["id", "name", "label"],
-    "module_bay_templates": ["id", "name", "position", "label"],
+    "device_bay_templates": ["id", "name", "label", "description"],
+    "module_bay_templates": ["id", "name", "position", "label", "description"],
 }
 
 # Endpoints whose GraphQL schema has no ``module_type`` parent field.
-_NO_MODULE_TYPE = {"device_bay_templates", "module_bay_templates"}
+# Note: module_bay_templates is intentionally excluded from this set — NetBox's
+# module_bay_template_list DOES support module_type { id }, so we must include it
+# in the query to correctly cache module bays owned by module types.
+_NO_MODULE_TYPE = {"device_bay_templates"}
 
 
 class NetBoxGraphQLClient:
@@ -182,15 +200,21 @@ class NetBoxGraphQLClient:
         self._session.close()
 
     def __enter__(self):
+        """Return *self* to support use as a context manager."""
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        """Close the session on context-manager exit."""
         self.close()
 
     # ── Low-level ──────────────────────────────────────────────────────────
 
-    def query(self, graphql_query, variables=None):
+    def query(self, graphql_query, variables=None, _retries=3):
         """Execute a single GraphQL query and return the ``data`` portion.
+
+        Retries up to *_retries* times (with exponential back-off) on transient
+        connection errors so that a single dropped connection during a long
+        paginated fetch does not silently empty a component cache.
 
         Raises:
             GraphQLError: On HTTP errors or if the response contains GraphQL errors.
@@ -199,32 +223,43 @@ class NetBoxGraphQLClient:
         if variables is not None:
             payload["variables"] = variables
 
-        try:
-            response = self._session.post(
-                self.graphql_url,
-                json=payload,
-                timeout=60,
-            )
-            response.raise_for_status()
-            body = response.json()
-        except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 403:
-                raise GraphQLError(
-                    f"403 Forbidden from {self.graphql_url}\n"
-                    "Hint: Verify that your API token has the required permissions "
-                    "and that GraphQL is enabled in the NetBox configuration."
-                ) from exc
-            raise GraphQLError(str(exc)) from exc
-        except requests.RequestException as exc:
-            raise GraphQLError(str(exc)) from exc
-        except ValueError as exc:
-            raise GraphQLError(f"Invalid JSON response from NetBox GraphQL endpoint: {exc}") from exc
+        for attempt in range(1 + _retries):
+            try:
+                response = self._session.post(
+                    self.graphql_url,
+                    json=payload,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                body = response.json()
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                if status == 403:
+                    raise GraphQLError(
+                        f"403 Forbidden from {self.graphql_url}\n"
+                        "Hint: Verify that your API token has the required permissions "
+                        "and that GraphQL is enabled in the NetBox configuration."
+                    ) from exc
+                if status in {429, 502, 503, 504} and attempt < _retries:
+                    backoff = 2**attempt
+                    time.sleep(backoff)
+                    continue
+                # Non-transient HTTP errors are not retried.
+                raise GraphQLError(str(exc)) from exc
+            except requests.RequestException as exc:
+                if attempt < _retries:
+                    backoff = 2**attempt
+                    time.sleep(backoff)
+                    continue
+                raise GraphQLError(str(exc)) from exc
+            except ValueError as exc:
+                raise GraphQLError(f"Invalid JSON response from NetBox GraphQL endpoint: {exc}") from exc
 
-        if "errors" in body:
-            messages = "; ".join(e.get("message", str(e)) for e in body["errors"])
-            raise GraphQLError(messages)
+            if "errors" in body:
+                messages = "; ".join(e.get("message", str(e)) for e in body["errors"])
+                raise GraphQLError(messages)
 
-        return body.get("data", {})
+            return body.get("data", {})
 
     def query_all(self, graphql_query, list_key, page_size=None, variables=None, on_page=None):
         """Auto-paginate a GraphQL list query using offset/limit.
@@ -345,6 +380,7 @@ class NetBoxGraphQLClient:
             airflow
             weight
             weight_unit
+            description
             comments
             front_image { url }
             rear_image { url }
@@ -384,6 +420,12 @@ class NetBoxGraphQLClient:
           module_type_list(pagination: $pagination) {
             id
             model
+            part_number
+            airflow
+            description
+            comments
+            weight
+            weight_unit
             manufacturer {
               id
               name

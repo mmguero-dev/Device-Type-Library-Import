@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Entry-point script for importing NetBox device and module types from the community library."""
+
 from datetime import datetime
 import concurrent.futures
 import os
@@ -9,7 +11,9 @@ from core import settings
 from core.netbox_api import NetBox
 from core.log_handler import LogHandler
 from core.repo import DTLRepo
-from core.change_detector import ChangeDetector, IMAGE_PROPERTIES
+from core.change_detector import ChangeDetector, ChangeType, IMAGE_PROPERTIES
+from core.graphql_client import GraphQLError
+from pynetbox.core.query import RequestError as NetBoxRequestError
 
 
 import sys
@@ -124,6 +128,7 @@ def get_progress_wrapper(progress, iterable, desc=None, total=None, on_step=None
     task_id = progress.add_task(description, total=total)
 
     def iterator():
+        """Yield items from *iterable* while advancing the progress task."""
         count = 0
         try:
             for item in iterable:
@@ -304,6 +309,11 @@ def log_run_mode(handle, args):
                 "Mode: will not remove components from existing models; use --remove-components with "
                 "--update to change this."
             )
+        if getattr(args, "force_resolve_conflicts", False):
+            handle.log(
+                "Mode: --force-resolve-conflicts enabled; constraint failures will trigger destructive "
+                "remediation when no live device references the affected type."
+            )
     else:
         handle.log("Mode: --update not set; changed properties/components will not be applied (use --update).")
 
@@ -330,6 +340,7 @@ def _image_progress_scope(progress, device_types, total=0):
         _img_task = progress.add_task("Uploading Images", total=total)
 
         def _adv_img(count=1):
+            """Advance the image-upload progress task by *count* steps."""
             progress.update(_img_task, advance=count)
 
         device_types._image_progress = _adv_img
@@ -533,27 +544,55 @@ def _process_module_types(
 
     module_only_new = should_only_create_new_modules(args)
     existing_module_types = netbox.get_existing_module_types()
-    module_types_to_process, module_type_existing_images = netbox.filter_actionable_module_types(
+    # Always run full change detection (unless --only-new is explicitly set) so that
+    # modified module types are reported even without --update.
+    module_types_to_process, module_type_existing_images, changed_property_log = netbox.filter_actionable_module_types(
         module_types,
         existing_module_types,
-        only_new=module_only_new,
+        only_new=args.only_new,
     )
 
     new_module_count = len(NetBox.filter_new_module_types(module_types, existing_module_types))
-    if module_only_new:
-        handle.log("============================================================")
+    # Count modules whose only diff is REMOVED components — they will require
+    # --remove-components to converge.  We count groups that have at least one removed
+    # component change; the advisory is informational so over-counting modules that also
+    # have other changes is fine.
+    pending_removal_modules = 0
+    pending_removal_components = 0
+    for _slug, _model, fields_info, comp_changes in changed_property_log:
+        removed_in_group = [
+            c for c in (comp_changes or []) if getattr(c, "change_type", None) == ChangeType.COMPONENT_REMOVED
+        ]
+        if removed_in_group:
+            pending_removal_modules += 1
+            pending_removal_components += len(removed_in_group)
+    handle.log("============================================================")
+    handle.log("MODULE TYPE CHANGE DETECTION")
+    handle.log("============================================================")
+    if args.only_new:
         handle.log(f"New module types: {new_module_count}")
-        handle.log("============================================================")
     else:
-        module_changed_count = len(module_types_to_process) - new_module_count
+        module_changed_count = len(changed_property_log)
         module_unchanged_count = len(module_types) - len(module_types_to_process)
-        handle.log("============================================================")
-        handle.log("MODULE TYPE CHANGE DETECTION")
-        handle.log("============================================================")
+        # Modules with only missing image attachments — handled in default mode, so
+        # they are NOT included in the "modified" count and do NOT trigger the
+        # `--update` hint.
+        image_only_count = max(0, len(module_types_to_process) - new_module_count - module_changed_count)
         handle.log(f"New module types:       {new_module_count}")
         handle.log(f"Unchanged module types: {module_unchanged_count}")
         handle.log(f"Modified module types:  {module_changed_count}")
-        handle.log("------------------------------------------------------------")
+        if image_only_count:
+            handle.log(f"Image-only updates:     {image_only_count}")
+        if module_changed_count and not args.update:
+            handle.log("  (Run with --update to apply changes to existing module types)")
+        if pending_removal_modules and not args.remove_components:
+            remove_hint = "--remove-components" if args.update else "--update --remove-components"
+            handle.log(
+                f"  (Run with {remove_hint} to remove {pending_removal_components} stale "
+                f"component(s) across {pending_removal_modules} module type(s))"
+            )
+    handle.log("------------------------------------------------------------")
+    netbox.log_module_type_changes(changed_property_log)
 
     if module_types_to_process:
         netbox.create_manufacturers(module_vendors)
@@ -567,6 +606,7 @@ def _process_module_types(
                 only_new=module_only_new,
                 all_module_types=existing_module_types,
                 module_type_existing_images=module_type_existing_images,
+                remove_components=args.remove_components,
             )
     else:
         handle.verbose_log("No module type changes to process.")
@@ -635,28 +675,61 @@ def _process_rack_types(args, netbox, dtl_repo, handle, progress, selected_vendo
         )
 
 
-def _log_run_summary(handle, netbox, start_time):
+def _log_run_summary(handle, netbox, start_time, dtl_repo=None):
     """Log the final import summary counters to *handle*.
 
     Args:
         handle (LogHandler): Logging handler for output.
         netbox (NetBox): NetBox API wrapper whose ``counter`` is read.
         start_time (datetime): Timestamp from the start of the run for elapsed-time reporting.
+        dtl_repo (DTLRepo, optional): Repository helper; if provided, any duplicate
+            ``(manufacturer, model)`` definitions detected during YAML parsing are listed
+            so the user can fix them upstream.
     """
     handle.log("---")
     handle.verbose_log(f"Script took {(datetime.now() - start_time)} to run")
     handle.log(f"{netbox.counter['added']} device types created")
     handle.log(f"{netbox.counter['properties_updated']} device types updated")
+    component_updates = netbox.counter.get("device_types_component_updates", 0)
+    if component_updates:
+        handle.log(f"{component_updates} device types had component-only updates")
+    failed = netbox.counter.get("device_types_failed", 0)
+    if failed:
+        handle.log(f"{failed} device types FAILED to update (see error log above)")
     handle.log(f"{netbox.counter['components_updated']} components updated")
     handle.log(f"{netbox.counter['components_added']} components added")
     handle.log(f"{netbox.counter['components_removed']} components removed")
     handle.verbose_log(f"{netbox.counter['images']} images uploaded")
     handle.log(f"{netbox.counter['manufacturer']} manufacturers created")
-    if settings.NETBOX_FEATURES["modules"]:
+    if netbox.modules:
         handle.log(f"{netbox.counter['module_added']} modules created")
+        handle.log(f"{netbox.counter['module_updated']} modules updated")
+        if netbox.counter["module_update_failed"]:
+            handle.log(f"{netbox.counter['module_update_failed']} modules failed to update")
+        if netbox.counter["module_partial_update"]:
+            handle.log(f"{netbox.counter['module_partial_update']} modules partially updated")
     if netbox.rack_types:
         handle.log(f"{netbox.counter['rack_type_added']} rack types created")
         handle.log(f"{netbox.counter['rack_type_updated']} rack types updated")
+
+    # Structured failure / partial-update report (replaces the "see error log
+    # above" hand-wave with itemised per-entity context).
+    failure_lines = netbox.outcomes.render_failure_report()
+    for line in failure_lines:
+        handle.log(line)
+
+    if dtl_repo is not None and dtl_repo.duplicate_definitions:
+        handle.log("---")
+        handle.log(
+            f"WARNING: {len(dtl_repo.duplicate_definitions)} duplicate "
+            "(manufacturer, model) definition(s) detected in the source repository:"
+        )
+        for dup in dtl_repo.duplicate_definitions:
+            handle.log(f"  {dup['manufacturer']}/{dup['model']}")
+            handle.log(f"    kept:    {dup['kept']}")
+            for ignored in dup["ignored"]:
+                handle.log(f"    ignored: {ignored}")
+        handle.log("These duplicates would otherwise oscillate on every run. Please report/fix them upstream.")
 
 
 def main():
@@ -668,7 +741,7 @@ def main():
     """
     startTime = datetime.now()
 
-    parser = ArgumentParser(description="Import Netbox Device Types")
+    parser = ArgumentParser(description="Import Netbox Device Types", allow_abbrev=False)
     parser.add_argument(
         "--vendors",
         nargs="+",
@@ -717,11 +790,23 @@ def main():
         help="Remove components from NetBox that no longer exist in YAML (use with --update). "
         "WARNING: May affect existing device instances.",
     )
+    parser.add_argument(
+        "--force-resolve-conflicts",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow destructive remediation when a NetBox business-logic constraint blocks an update "
+            "(e.g. delete blocking device-bay templates before a subdevice_role parent->child flip). "
+            "Only applied when no live device references the type. WARNING: Destructive."
+        ),
+    )
 
     args = parser.parse_args()
 
     if args.remove_components and not args.update:
         parser.error("--remove-components requires --update")
+    if args.force_resolve_conflicts and not args.update:
+        parser.error("--force-resolve-conflicts requires --update")
 
     # Normalize arguments
     args.vendors = [v.casefold() for vendor in args.vendors for v in vendor.split(",") if v.strip()]
@@ -737,6 +822,7 @@ def main():
     # We pass settings for constants, but ideally we should pass individual config items
     # For now, we will update NetBox to verify compatibility with this new setup
     netbox = NetBox(settings, handle)  # handle passed explicitly
+    netbox.force_resolve_conflicts = args.force_resolve_conflicts
 
     # Confirm effective run behavior right after compatibility checks.
     log_run_mode(handle, args)
@@ -754,6 +840,7 @@ def main():
             parse_fn = None
 
             def on_parse_step():
+                """Invoke *parse_fn* (if set) after each parsed file, used to pump preload progress."""
                 if parse_fn is not None:
                     parse_fn()
 
@@ -766,6 +853,7 @@ def main():
                 if progress is not None:
 
                     def pump_preload():
+                        """Drain pending preload-progress updates from the background preload job."""
                         netbox.device_types.pump_preload_progress(cache_preload_job, progress)
 
                     parse_fn = pump_preload
@@ -819,7 +907,7 @@ def main():
                 _module_parse_executor.shutdown(wait=False, cancel_futures=True)
             handle.set_console(None)
 
-    _log_run_summary(handle, netbox, startTime)
+    _log_run_summary(handle, netbox, startTime, dtl_repo=dtl_repo)
 
 
 if __name__ == "__main__":
@@ -828,3 +916,19 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Interrupted by user (Ctrl-C). Exiting.")
         raise SystemExit(130)
+    except GraphQLError as exc:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Error: NetBox GraphQL request failed — {exc}\n"
+            f"[{datetime.now().strftime('%H:%M:%S')}] This may be a temporary connectivity issue. "
+            "Check that NetBox is reachable and try again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except NetBoxRequestError as exc:
+        print(
+            f"[{datetime.now().strftime('%H:%M:%S')}] Error: NetBox REST API request failed — {exc}\n"
+            f"[{datetime.now().strftime('%H:%M:%S')}] Check that NetBox is reachable and"
+            " the API token has the required permissions.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)

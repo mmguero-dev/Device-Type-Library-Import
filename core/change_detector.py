@@ -4,11 +4,14 @@ Provides functionality to detect differences between device type definitions
 in the repository and existing data in NetBox, supporting the --update workflow.
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
 from enum import Enum
 
 from core.normalization import normalize_values
+from core.formatting import log_property_diffs
+from core.schema_reader import load_properties_for_type
 
 
 class ChangeType(Enum):
@@ -72,8 +75,12 @@ class ChangeReport:
     unchanged_count: int = 0
 
 
-# Device type properties that can be compared and updated
-DEVICE_TYPE_PROPERTIES = [
+# Device type properties that can be compared and updated.
+# Loaded from the cloned devicetype-library schema at runtime; the list below
+# serves as a fallback when the schema is not yet available.  Identity fields
+# (manufacturer, model, slug) and image fields (front_image, rear_image) are
+# excluded by the schema reader — images are handled separately via IMAGE_PROPERTIES.
+_DEVICE_TYPE_PROPERTIES_FALLBACK = [
     "u_height",
     "part_number",
     "is_full_depth",
@@ -81,8 +88,53 @@ DEVICE_TYPE_PROPERTIES = [
     "airflow",
     "weight",
     "weight_unit",
+    "description",
     "comments",
 ]
+
+_DEVICE_TYPE_SCHEMA_EXCLUDE = {"manufacturer", "model", "slug", "front_image", "rear_image"}
+
+
+def _load_device_type_properties():
+    """Load device type scalar properties from the schema, falling back to hardcoded list."""
+    try:
+        from core import settings as _settings
+
+        props = load_properties_for_type(
+            os.path.join(_settings.REPO_PATH, "schema"),
+            "devicetype",
+            exclude=_DEVICE_TYPE_SCHEMA_EXCLUDE,
+        )
+        return props if props else list(_DEVICE_TYPE_PROPERTIES_FALLBACK)
+    except (ImportError, AttributeError):
+        return list(_DEVICE_TYPE_PROPERTIES_FALLBACK)
+
+
+_CACHED_DEVICE_TYPE_PROPERTIES = None
+
+
+def get_device_type_properties():
+    """Lazily resolve and cache the device-type schema properties.
+
+    Resolved at first call rather than at import time so the schema lookup
+    sees a populated repo even when ``change_detector`` is imported before
+    the repo is cloned (e.g., test bootstrap, fresh CI environments).
+    """
+    global _CACHED_DEVICE_TYPE_PROPERTIES
+    if _CACHED_DEVICE_TYPE_PROPERTIES is None:
+        _CACHED_DEVICE_TYPE_PROPERTIES = _load_device_type_properties()
+    return _CACHED_DEVICE_TYPE_PROPERTIES
+
+
+# Backwards-compatible eager constant.  Prefer ``get_device_type_properties()``
+# in code paths that may run before the repo schema is available.
+DEVICE_TYPE_PROPERTIES = _load_device_type_properties()
+
+# Sentinel used to distinguish "attribute missing from record" from a genuine
+# None/null value returned by NetBox.  When a property is in the schema-derived
+# comparison list but was not fetched by the GraphQL query, getattr returns this
+# sentinel and the property is skipped to avoid false-positive change detection.
+_MISSING = object()
 
 # Image properties: YAML uses boolean flags, NetBox stores URL strings.
 # Only existence is compared (YAML=true vs NetBox=empty).
@@ -92,34 +144,23 @@ IMAGE_PROPERTIES = ["front_image", "rear_image"]
 COMPONENT_TYPES = {
     "interfaces": (
         "interface_templates",
-        ["name", "type", "mgmt_only", "label", "enabled", "poe_mode", "poe_type"],
+        ["name", "type", "mgmt_only", "label", "enabled", "poe_mode", "poe_type", "description", "rf_role"],
     ),
     "power-ports": (
         "power_port_templates",
-        ["name", "type", "maximum_draw", "allocated_draw", "label"],
+        ["name", "type", "maximum_draw", "allocated_draw", "label", "description"],
     ),
-    "console-ports": ("console_port_templates", ["name", "type", "label"]),
-    "power-outlets": ("power_outlet_templates", ["name", "type", "feed_leg", "label"]),
+    "console-ports": ("console_port_templates", ["name", "type", "label", "description"]),
+    "power-outlets": ("power_outlet_templates", ["name", "type", "feed_leg", "label", "description"]),
     "console-server-ports": (
         "console_server_port_templates",
-        ["name", "type", "label"],
+        ["name", "type", "label", "description"],
     ),
-    "rear-ports": ("rear_port_templates", ["name", "type", "positions", "label"]),
-    "front-ports": ("front_port_templates", ["name", "type", "_mappings", "label"]),
-    "device-bays": ("device_bay_templates", ["name", "label"]),
-    "module-bays": ("module_bay_templates", ["name", "position", "label"]),
+    "rear-ports": ("rear_port_templates", ["name", "type", "positions", "label", "description", "color"]),
+    "front-ports": ("front_port_templates", ["name", "type", "_mappings", "label", "description", "color"]),
+    "device-bays": ("device_bay_templates", ["name", "label", "description"]),
+    "module-bays": ("module_bay_templates", ["name", "position", "label", "description"]),
 }
-
-# Aliases for YAML keys that map to the same component type.
-# alias -> canonical key
-COMPONENT_ALIASES = {
-    "power-port": "power-ports",
-}
-
-# canonical key -> list of aliases
-COMPONENT_ALIASES_BY_CANONICAL = {}
-for alias, canonical_key in COMPONENT_ALIASES.items():
-    COMPONENT_ALIASES_BY_CANONICAL.setdefault(canonical_key, []).append(alias)
 
 
 class ChangeDetector:
@@ -198,15 +239,20 @@ class ChangeDetector:
         """
         changes = []
 
-        for prop in DEVICE_TYPE_PROPERTIES:
+        for prop in get_device_type_properties():
             # Only compare properties explicitly present in YAML;
             # an omitted property means the YAML doesn't manage it,
             # matching the component semantics (absent key != removal).
             if prop not in yaml_data:
                 continue
+            # Only compare properties that were actually fetched from NetBox.
+            # If the GraphQL query doesn't include a field yet, skip it to
+            # avoid false-positive change detections.
+            netbox_value = getattr(netbox_dt, prop, _MISSING)
+            if netbox_value is _MISSING:
+                continue
 
             yaml_value = yaml_data.get(prop)
-            netbox_value = getattr(netbox_dt, prop, None)
 
             yaml_value, netbox_value = normalize_values(yaml_value, netbox_value)
 
@@ -278,14 +324,6 @@ class ChangeDetector:
         for yaml_key, (cache_name, properties) in COMPONENT_TYPES.items():
             yaml_components = list(yaml_data.get(yaml_key) or [])
 
-            # Check whether the canonical key or any alias is actually present in YAML
-            aliases_for_key = COMPONENT_ALIASES_BY_CANONICAL.get(yaml_key, [])
-            key_present = yaml_key in yaml_data or any(alias in yaml_data for alias in aliases_for_key)
-
-            # Merge components from any aliases that map to this canonical key
-            for alias in aliases_for_key:
-                yaml_components.extend(yaml_data.get(alias) or [])
-
             # Get cached components for this device type
             cached = self.device_types.cached_components.get(cache_name, {})
             existing_components = cached.get(cache_key, {})
@@ -296,7 +334,7 @@ class ChangeDetector:
             # Check for removed components (exist in NetBox but not in YAML)
             # Only flag removals when the YAML explicitly defines this component type;
             # a missing key means the YAML doesn't manage this type at all.
-            if key_present:
+            if yaml_key in yaml_data:
                 for existing_name in existing_components.keys():
                     if existing_name not in yaml_component_names:
                         changes.append(
@@ -371,7 +409,11 @@ class ChangeDetector:
                     )
                     for m in yaml_mappings
                 )
-                canonical = getattr(netbox_comp, "_mappings_canonical", None) or []
+                canonical = getattr(netbox_comp, "_mappings_canonical", None)
+                if canonical is None:
+                    # GraphQL response lacked both mappings and rear_port_position;
+                    # treat as unmanaged to avoid a false COMPONENT_CHANGED.
+                    continue
                 has_names = any(m.get("rear_port_name") is not None for m in canonical)
                 if has_names:
                     # NetBox >= 4.5: compare with rear port names
@@ -415,7 +457,12 @@ class ChangeDetector:
                 continue
 
             yaml_value = yaml_comp.get(prop)
-            netbox_value = getattr(netbox_comp, prop, None)
+            netbox_value = getattr(netbox_comp, prop, _MISSING)
+            if netbox_value is _MISSING:
+                # NetBox version / GraphQL selection didn't return this field;
+                # treat it as unmanaged to avoid a false COMPONENT_CHANGED that
+                # would PATCH an unsupported attribute.
+                continue
 
             yaml_value, netbox_value = normalize_values(yaml_value, netbox_value)
 
@@ -430,14 +477,11 @@ class ChangeDetector:
 
         return changes
 
-    def _log_modified_summary(self, report: ChangeReport) -> int:
+    def _log_modified_summary(self, report: ChangeReport) -> None:
         """Compute category counts and log the summary section for modified device types.
 
         Args:
             report: The ChangeReport containing modified_device_types to summarise.
-
-        Returns:
-            The count of device types that have removed components.
         """
         ct_props = 0
         ct_images = 0
@@ -471,20 +515,13 @@ class ChangeDetector:
         if parts:
             self.handle.log(f"  Breakdown: {', '.join(parts)}")
 
-        return ct_removed
-
     def _log_property_diffs(self, prop_changes: List[PropertyChange], indent: str) -> None:
         """Emit diff-u style lines for *prop_changes* at the given *indent*."""
-        if not prop_changes:
-            return
-        pad = min(max(len(pc.property_name) for pc in prop_changes), 30)
-        for pc in prop_changes:
-            name = f"{pc.property_name}:{'':{max(0, pad - len(pc.property_name))}}"
-            blank = " " * len(name)
-            for i, line in enumerate(str(pc.old_value).splitlines() or [""]):
-                self.handle.verbose_log(f"{indent}- {name if i == 0 else blank} {line}")
-            for i, line in enumerate(str(pc.new_value).splitlines() or [""]):
-                self.handle.verbose_log(f"{indent}+ {name if i == 0 else blank} {line}")
+        log_property_diffs(
+            [(pc.property_name, pc.old_value, pc.new_value) for pc in prop_changes],
+            self.handle.verbose_log,
+            indent,
+        )
 
     def _log_modified_device_details(self, dt: DeviceTypeChange):
         """Log the per-device detail section for a single modified device type.
@@ -496,13 +533,23 @@ class ChangeDetector:
         changed = [c for c in dt.component_changes if c.change_type == ChangeType.COMPONENT_CHANGED]
         removed = [c for c in dt.component_changes if c.change_type == ChangeType.COMPONENT_REMOVED]
 
-        if removed:
-            self.handle.log(f"  ~ {dt.manufacturer_slug}/{dt.model}")
-        else:
-            self.handle.verbose_log(f"  ~ {dt.manufacturer_slug}/{dt.model}")
-
         prop_changes = [pc for pc in dt.property_changes if pc.property_name not in IMAGE_PROPERTIES]
         image_changes = [pc for pc in dt.property_changes if pc.property_name in IMAGE_PROPERTIES]
+
+        # Build a short inline summary so the name line is informative even without --verbose.
+        parts = []
+        if prop_changes:
+            parts.append(f"{len(prop_changes)} prop")
+        if image_changes:
+            parts.append(f"{len(image_changes)} image")
+        if added:
+            parts.append(f"+{len(added)} component")
+        if changed:
+            parts.append(f"~{len(changed)} component")
+        if removed:
+            parts.append(f"-{len(removed)} component")
+        suffix = f"  [{', '.join(parts)}]" if parts else ""
+        self.handle.log(f"  ~ {dt.manufacturer_slug}/{dt.model}{suffix}")
 
         if prop_changes or image_changes:
             self.handle.verbose_log("    Properties:")
@@ -512,16 +559,14 @@ class ChangeDetector:
                 self.handle.verbose_log(f"      ~ {label}: missing in NetBox (YAML defines image)")
 
         if added:
-            self.handle.verbose_log(f"      + {len(added)} new component(s)")
             for comp in added:
                 self.handle.verbose_log(f"        + {comp.component_type}: {comp.component_name}")
         if changed:
-            self.handle.verbose_log(f"      ~ {len(changed)} changed component(s)")
             for comp in changed:
                 self.handle.verbose_log(f"        ~ {comp.component_type}: {comp.component_name}")
                 self._log_property_diffs(comp.property_changes, "            ")
         if removed:
-            self.handle.log(f"      - {len(removed)} removed component(s) (not deleted without --remove-components)")
+            self.handle.log(f"      - {len(removed)} component(s) not in YAML (deleted with --remove-components)")
             for comp in removed:
                 self.handle.verbose_log(f"        - {comp.component_type}: {comp.component_name}")
 
@@ -535,16 +580,14 @@ class ChangeDetector:
         self.handle.log(f"Unchanged device types: {report.unchanged_count}")
 
         if report.modified_device_types:
-            ct_removed = self._log_modified_summary(report)
+            self._log_modified_summary(report)
 
             self.handle.log("-" * 60)
             self.handle.log("MODIFIED DEVICE TYPES:")
             for dt in report.modified_device_types:
                 self._log_modified_device_details(dt)
-
-            verbose_only = len(report.modified_device_types) - ct_removed
-            if verbose_only > 0 and not self.handle.args.verbose:
-                self.handle.log(f"  ({verbose_only} more without removals — use --verbose to list)")
+            if not self.handle.args.verbose:
+                self.handle.log("  (use --verbose for property diffs and component names)")
         else:
             self.handle.log("Modified device types: 0")
 
