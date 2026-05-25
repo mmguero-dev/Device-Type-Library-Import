@@ -2,6 +2,29 @@
 
 <!-- version list -->
 
+## v1.6.0 (2026-05-25)
+
+### Chores
+
+- **ci**: Bump the github-actions group with 4 updates (#79, [`87e9ff7`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/87e9ff7235fcc72878b66ac4aef213cc3390cd33))
+- **deps**: Bump the python-deps group with 2 updates (#72, [`d85e35d`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/d85e35d8ba729647c365bd79ccfbf7cdf4a88038))
+- **deps**: Bump idna from 3.11 to 3.15 (#73, [`fcb7687`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/fcb76873cf86ee35838992fa2a42fac7a894f142))
+- **deps**: Bump the python-deps group with 2 updates (#71, [`eee6356`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/eee6356f9af7aa9a774ef8d11bfe20d4bb63ee94))
+- **deps**: Bump urllib3 from 2.6.3 to 2.7.0 (#70, [`4f2a785`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/4f2a78526607c3c656756aaa1aac4f1f471e0a7f))
+- **deps**: Bump gitpython from 3.1.49 to 3.1.50 (#69, [`5f396b9`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/5f396b912e3a78a32d72735ad6e5d0b86eca0c84))
+- **deps**: Bump gitpython in the python-deps group (#68, [`6722cca`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/6722ccaaed3fb107a524e8988df303801cecb22f))
+
+
+### Features
+
+- Per-vendor fetch, export-diff, verify-images, remove-unmanaged-types (#74, [`6fa0026`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/6fa0026cab3380b955e5631b5da41a0494d164ff))
+
+
+
+### Contributors
+
+@dependabot[bot], @marcinpsk
+
 ## v1.5.0 (2026-05-02)
 
 ### Bug Fixes
@@ -50,7 +73,7 @@
 
 ### Features
 
-- `--verify-images`: verify image physical presence and content hash, re-upload if missing or changed
+- Schema-driven property comparison for device/module types (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
 - Full component comparison for module types with description/color/rf_role coverage (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
 - Validate graphql component fetch counts against rest api (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
 - Graphql count mismatch retry logic, 100% docstring coverage (#64, [`2af54a0`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/2af54a09255225f75457d159bbb6c5afbdf0f1e7))
