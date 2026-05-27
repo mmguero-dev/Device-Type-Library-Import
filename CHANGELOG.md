@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v1.6.1 (2026-05-27)
+
+### Bug Fixes
+
+- Warn-and-skip on duplicate repo keys instead of crashing (#81, [`d3910c3`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/d3910c36a2f216fd87e8a111d7e51891dda61509))
+
+
+### Chores
+
+- **deps**: Bump ruff from 0.15.13 to 0.15.14 in the python-deps group (#80, [`1572c95`](https://github.com/marcinpsk/Device-Type-Library-Import/commit/1572c95de706ac6d54a6b756172625f93d3a284d))
+
+
+
+### Contributors
+
+@dependabot[bot], @marcinpsk
+
 ## v1.6.0 (2026-05-25)
 
 ### Chores
